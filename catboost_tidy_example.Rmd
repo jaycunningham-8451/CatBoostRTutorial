@@ -1,0 +1,204 @@
+---
+title: "CatBoost Tidy Example"
+output:
+  html_document:
+    df_print: paged
+---
+
+The following is an example of using CatBoost, along with the treesnip library, with the tidymodels universe of packages. I'll keep commentary to a minimum.
+
+Libraries we'll need:
+
+```{r, results='hide', message=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(treesnip)
+library(parallel)
+```
+
+If `one_hot` is TRUE, then we'll one-hot encode all categorical variables (for performance metrics).
+
+```{r}
+one_hot <- FALSE
+```
+
+Using `parsnip::set_dependency()` to ensure that the libraries we're using will play nicely with parallelization:
+
+```{r}
+set_dependency("boost_tree", "catboost", "treesnip")
+set_dependency("boost_tree", "catboost", "catboost")
+```
+
+Setting up a compute cluster with all available cores:
+
+```{r}
+all_cores <- detectCores(logical = FALSE)
+cluster <- makeCluster(all_cores)
+doParallel::registerDoParallel(cluster)
+```
+
+We'll use the Ames housing data for this example, which has many categorical variables:
+
+```{r}
+set.seed(1234)
+
+ames <- AmesHousing::make_ames() %>%
+  janitor::clean_names()
+
+ames_split <- initial_split(ames, strata = sale_price)
+ames_train <- training(ames_split)
+ames_test <- testing(ames_split)
+```
+
+Setting up a recipe with transformations, such as one-hot encoding if we've specified it with `one_hot`:
+
+```{r}
+ames_recipe <- recipe(sale_price ~ ., data = ames_train) %>%
+  step_other(all_nominal(), threshold = 0.01) %>%
+  step_nzv(all_nominal())
+
+if (one_hot) {
+  ames_recipe <- ames_recipe %>% step_dummy(all_nominal())
+}
+
+ames_recipe <- ames_recipe %>% prep()
+
+ames_cv_folds <- bake(ames_recipe, new_data = ames_train) %>%
+  vfold_cv(v = 5)
+```
+
+Setting up the model, with tuning for `min_n`, `learn_rate`, and `tree_depth`:
+
+```{r}
+model <- boost_tree(
+  mode = "regression",
+  trees = 1000,
+  min_n = tune(),
+  learn_rate = tune(),
+  tree_depth = tune()
+) %>%
+  set_engine("catboost", loss_function = "RMSE")
+
+params <- parameters(
+  min_n(), 
+  tree_depth(range = c(4, 10)),
+  learn_rate()
+)
+```
+
+We'll use a grid size of 50 to keep runtime relatively down:
+
+```{r}
+tune_grid <- grid_max_entropy(params, size = 50)
+```
+
+Performing the actual hyperparameter tuning:
+
+```{r}
+wf <- workflow() %>%
+  add_model(model) %>%
+  add_formula(sale_price ~ .)
+
+tuned <- tune_grid(
+  object = wf,
+  resamples = ames_cv_folds,
+  grid = tune_grid,
+  metrics = metric_set(rmse, rsq, mae),
+  control = control_grid(verbose = TRUE)
+)
+```
+
+The best parameters:
+
+```{r}
+tuned %>%
+  show_best(metric = "rmse", n = 10) %>%
+  pivot_longer(min_n:learn_rate, names_to = "variable", values_to = "value") %>%
+  ggplot(aes(value, mean)) +
+  geom_line(alpha = 1/2) +
+  geom_point() +
+  facet_wrap(~variable, scales = "free") +
+  ggtitle("Best parameters for RMSE")
+```
+Creating the final model with the best parameters:
+
+```{r}
+best_params <-
+  tuned %>%
+  select_best("rmse")
+
+model_final <-
+  model %>%
+  finalize_model(best_params)
+```
+
+Finding metrics for the training set:
+
+```{r}
+train_processed <- bake(ames_recipe, new_data = ames_train)
+
+trained_model_all_data <- model_final %>%
+  fit(formula = sale_price ~ ., data = train_processed)
+
+train_prediction <- trained_model_all_data %>%
+  predict(new_data = train_processed) %>%
+  bind_cols(ames_train)
+
+train_prediction %>%
+  metrics(sale_price, .pred) %>%
+  mutate(.estimate = format(round(.estimate, 2), big.mark = ",")) %>%
+  knitr::kable()
+```
+
+Without one-hot encoding:
+
+    |.metric |.estimator |.estimate |
+    |:-------|:----------|:---------|
+    |rmse    |standard   |16,066.88 |
+    |rsq     |standard   |0.96      |
+    |mae     |standard   |11,405.21 |
+
+With one-hot encoding:
+
+    |.metric |.estimator |.estimate |
+    |:-------|:----------|:---------|
+    |rmse    |standard   |19,090.05 |
+    |rsq     |standard   |0.94      |
+    |mae     |standard   |13,655.17 |
+
+Finding metrics for the training set:
+
+```{r}
+test_processed <- bake(ames_recipe, new_data = ames_test)
+
+test_prediction <- trained_model_all_data %>%
+  predict(new_data = test_processed) %>%
+  bind_cols(ames_test)
+
+test_prediction %>%
+  metrics(sale_price, .pred) %>%
+  mutate(.estimate = format(round(.estimate, 2), big.mark = ",")) %>%
+  knitr::kable()
+```
+
+Without one-hot encoding:
+
+    |.metric |.estimator |.estimate |
+    |:-------|:----------|:---------|
+    |rmse    |standard   |28,423.69 |
+    |rsq     |standard   |0.87      |
+    |mae     |standard   |16,079.05 |
+
+With one-hot encoding:
+
+    |.metric |.estimator |.estimate |
+    |:-------|:----------|:---------|
+    |rmse    |standard   |29,019.83 |
+    |rsq     |standard   |0.87      |
+    |mae     |standard   |17,642.67 |
+
+Admittedly not an extraordinary improvement, but CatBoost's handling of categorical variables improves RMSE by about 2% and MAE by about 10%.
+
+```{r}
+stopCluster(cluster)
+```

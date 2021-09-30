@@ -1,0 +1,165 @@
+---
+title: "Basic CatBoost Example"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Installing CatBoost
+
+Unfortunately CatBoost isn't on CRAN, and isn't structured so that you could install it via `remotes`::install_github`. You have to visit the GitHub releases page, find the URL for the newest R release for your OS, and install it via:
+
+```{r, eval=FALSE}
+binary_url <- "https://github.com/catboost/catboost/releases/download/v0.26.1/catboost-R-Darwin-0.26.1.tgz"
+
+remotes::install_url(
+  binary_url, 
+  INSTALL_opts = c("--no-multiarch", "--no-test-load")
+)
+```
+
+While you're at it consider installing treesnip, which allows you to use CatBoost (and lightgbm) with tidymodels:
+
+```{r, eval=FALSE}
+remotes::install_github("curso-r/treesnip")
+```
+
+# Preliminaries
+
+We'll be using the Ames housing dataset, available from the AmesHousing package.
+
+```{r, message=FALSE, results='hide'}
+library(rsample)
+library(catboost)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+
+set.seed(1234)
+
+ames <- AmesHousing::make_ames() %>% 
+  janitor::clean_names()
+ames_split <- initial_split(ames, strata = "sale_price")
+ames_train <- training(ames_split)
+ames_test <- testing(ames_split)
+```
+
+The Ames dataset is nice for our purposes as it contains many factor variables:
+
+```{r}
+ames %>% map(class) %>% keep(. == "factor") %>% length()
+```
+
+# Using CatBoost
+
+One thing you should be aware of is that CatBoost prefaces each function it exports with `catboost.`:
+
+```{r}
+ls("package:catboost") %>% stringr::str_detect("^catboost\\.") %>% all()
+```
+
+To use CatBoost, you'll have to convert the datasets into a particular format. If you're familiar with lightgbm, it looks a bit like that.
+
+```{r}
+ames_train_pool <- catboost.load_pool(
+    data = ames_train %>% select(-sale_price),
+    label = ames_train$sale_price
+)
+
+ames_test_pool <- catboost.load_pool(
+    data = ames_test %>% select(-sale_price),
+    label = ames_test$sale_price
+)
+```
+
+You could also give it a CSV file to read, or supply it with row or group weights, etc. The documentation indicates that you should specify categorical variable indices with the argument `cat_features`, but if you do so you'll be greeted with the message that it's unnecessary and that you should convert your categorical features to factors.
+
+Training a model is now pretty easily done:
+
+```{r, message=FALSE, results='hide'}
+params <- list(
+  loss_function = "RMSE",
+  custom_loss = "R2",
+  iterations = 500,
+  depth = 8,
+  learning_rate = 0.08
+)
+
+model <- catboost.train(
+    learn_pool = ames_train_pool, test_pool = ames_test_pool, params = params
+)
+```
+
+See the documentation for `catboost.train()` for more information on the possible configuration parameters.
+
+I've hidden the output because it's 2000 lines, but at the end it gives the following message:
+
+    bestTest = 23935.587
+    bestIteration = 492
+
+    Shrink model to first 493 iterations.
+
+You can shrink the model with `catboost.shrink()`:
+
+```{r}
+catboost.shrink(model, 493)
+```
+
+You don't use base R's `predict` function for predictions, but rather `catboost.predict()`, which works on a CatBoost pool object:
+
+```{r}
+test_predictions <- catboost.predict(model, ames_test_pool)
+
+r2 <- cor(ames_test$sale_price, test_predictions)^2
+r2
+```
+
+Though you can also compute $R^2$ using the `catboost.eval_metrics()` function:
+
+```{r}
+catboost.eval_metrics(model, ames_test_pool, "R2") %>%
+  as_tibble() %>%
+  mutate(row = row_number()) %>%
+  ggplot(aes(row, R2)) +
+  geom_point() +
+  ggtitle("R2 by Iteration")
+```
+
+You can also get feature importance:
+
+```{r}
+feature_importance <- catboost.get_feature_importance(
+  model, 
+  pool = ames_test_pool, 
+  type = "FeatureImportance"
+)
+
+tibble(
+  column = rownames(feature_importance), 
+  importance = feature_importance[,1]
+) %>% 
+  arrange(desc(importance)) %>%
+  head(5) %>%
+  knitr::kable()
+```
+`catboost.get_feature_importance()` supports other `type`s, such as `ShapValues`.
+
+# Other Useful Functions
+
+You can find the k-fold cross validation error with `catboost.cv()`, which operates much like `catboost.train()`:
+
+```{r, results='hide', message=FALSE}
+cv_results <- catboost.cv(
+    pool = ames_train_pool, 
+    params = params,
+    fold_count = 3,
+    partition_random_seed = 1024
+)
+```
+
+```{r}
+cv_results[which.min(cv_results$test.RMSE.mean),] %>% 
+  knitr::kable()
+```
+
+Another function that might be useful (though we'll not go over it here) is `catboost.caret()`, which can be passed as a `method` to `caret::train()`.

@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="" xml:lang="">
+  <head>
+    <title>Categorical Variables with CatBoost</title>
+    <meta charset="utf-8" />
+    <meta name="author" content="Jay Cunningham" />
+    <script src="libs/header-attrs-2.11/header-attrs.js"></script>
+    <link href="libs/remark-css-0.0.1/default.css" rel="stylesheet" />
+    <link href="libs/remark-css-0.0.1/default-fonts.css" rel="stylesheet" />
+  </head>
+  <body>
+    <textarea id="source">
+class: center, middle, inverse, title-slide
+
+# Categorical Variables with CatBoost
+### Jay Cunningham
+### 84.51°
+### 2021/10/02
+
+---
+
+class: inverse, center, middle
+
+# The Problem
+
+---
+
+# Handling Categorical Variables
+
+* We've all been there: you have a supervised learning problem in the context of tabular data, and a tree-based approach seems like the best fit. 
+
+--
+
+* But your dataset contains a categorical variable `\(x_j\)` with reasonably high cardinality `\(K\)` and no ordinal interpretation.
+
+--
+
+* To find the best split for `\(x_j\)` would in principle require examining `\(2^K-1\)` subsets of the set of categories included within `\(x_j\)`. (If you already know One Neat Trick for this, don't spoil it.)
+
+--
+
+* Some libraries, like xgboost and scikit-learn, just punt at this point. You're responsible for converting `\(x_j\)` into a numerical variable somehow. Some are cleverer, but we'll get to that.
+
+--
+
+* Even libraries that can handle categorical variables cleverly, like ranger and lightgbm, don't do so by default (and lightgbm has mixed messaging on whether you should use that functionality).
+
+---
+
+# Preprocessing Categorical Variables
+
+If you want to preprocess `\(x_j\)` yourself, you have a few options. This is obviously a non-exhaustive list:
+
+--
+
+* One-hot encode `\(x_j\)`, converting it to `\(K\)` individual binary features for each category. Unfortunately, this isn't a good fit for tree-based approaches.
+  * For high `\(K\)` this can introduce a great many new features, which may not play well with feature bagging.
+  * The binary indicator for each category `\(k\)` will usually be sparse and unlikely to be chosen at each split.
+
+--
+
+* Label / ordinal encode `\(x_j\)`, converting it to an integer with an arbitrary ordering. This can achieve fair results but is very unlikely to find an optimal split.
+
+--
+
+* Some other fancy encoding, like encoding by the number of times that category shows up in the dataset. Clever, but again, unlikely to chose an optimal split.
+
+--
+
+* Categorical embedding. But then you're stuck training a deep learning model, which can be costly in both time and money.
+
+
+---
+
+# Another Option
+
+* Maybe you've used randomForest or gbm before and noticed how they just handle factors without complaining (as long as they're of low enough cardinality in randomForest's case). What's going on here?
+
+--
+
+* Turns out there's a simple trick here that gets you the optimal split under general assumptions: simply order the categories within `\(x_j\)` by the mean of the target at that node and treat the result as a numerical variaåble.
+
+--
+
+* More generally, you can compute a target statistic (TS), such as replacing category `\(x_{jk}\)` with `$$\hat{x}_{jk} = \frac{\sum_{j=1}^n \mathbb{1}_{x_j^i=x_k^i} \cdot y_j + ap}{\sum_{j=1}^n 1_{x_j^i=x_k^i} + a}$$` where `\(p\)` is a prior (such as the overall mean of the target).
+
+--
+
+* Libraries that do something like this include randomForest, gbm, ranger (not by default), lightgbm, and I'm sure others.
+
+
+---
+
+# OK, What's the Problem?
+
+* If you think this looks like target encoding, you'd be right; that's essentially what we're doing here.
+
+--
+
+* And just like target encoding, this can lead to overfitting. Essentially, the distribution of `\(\hat{x}_j|y\)` differs at training vs test time.
+
+--
+
+* See the CatBoost paper for a simple classification example, where all training observations are perfectly classified but accuracy is only 0.5 at test time.
+
+--
+
+* In general, you'd want your choice of TS to obey a condition like: `$$\mathbb {E}(\hat{x}_j | y = v) = \mathbb{E}(\hat{x}_{jl} | y_l = v)$$` where `\((x_l, y_l)\)` is the `\(l\)`th training example. (P1 in the CatBoost paper.)
+
+---
+
+# What Does CatBoost Do?
+
+* How does CatBoost address this shift? They take a cue from online learning.
+
+--
+
+* They define an artificial ordering — a permutation `\(\sigma\)` of the training examples. Then, for each example `\(l\)`, they use all available history to compute the relevant target statistic, computing the TS for `$$D_l = \{x_j : \sigma(j) &lt; \sigma(l)\}$$`
+
+--
+
+* This satisfies P1 while using the entire dataset for training.
+
+--
+
+* To avoid higher variance for earlier training examples, they use different permutations at different steps.
+
+---
+
+# What *Else* Does CatBoost Do?
+
+This presentation is about the target encoding, but CatBoost does a few other nifty things.
+
+* They address another source of bias unrelated to its target encoding, what they call "prediction shift".
+
+--
+
+* The gradient at each iteration is estimated using values of the target of the same data points that the current model `\(F^{t-1}\)` was trained on, while the distribution of `\(F^{t-1}\)` differs at training vs test time, i.e. `$$\left(F^{t-1}(x_j)|x_j\right) \neq \left(F^{t-1}(x)|x\right)$$`
+
+--
+
+* Conceptually they address this by estimating different models for different sets of data, and computing residuals for an example by using a model trained without that example. It's a bit cleverer than that, though.
+
+--
+
+* Finally, CatBoost builds additional features by combining categorical features in a greedy fashion, consdiering only those features used in previous splits.
+
+---
+
+# Drawbacks of CatBoost
+
+* It's not available on CRAN. There's an open GitHub issue for this since 2018, so I'm not holding my breath that this will change soon. It's also not installable via `remotes::install_github()`.
+
+--
+
+* Its documentation is not great. 
+  * Some functions have no examples.
+  * There's jargon they never explain. (What's a Ctr? A click-through rate, apparently.)
+  * There are parameters they don't explain thoroughly. (Categorical features will be one-hot encoded if certain conditions are met, including the type of Ctr you're using. What are the types of Ctr? No clue.)
+
+---
+class: inverse, center, middle
+
+# Examples
+
+---
+
+class: inverse, center, middle
+
+# Conclusion
+
+---
+
+# Links
+
+* CatBoost paper: [bit.ly/CatBoostPaper](bit.ly/CatBoostPaper)
+* CatBoost website: [bit.ly/CatBoostSite](bit.ly/CatBoostSite)
+* Training parameters: [bit.ly/CatBoostParams](https://bit.ly/CatBoostParams)
+* Overview of handling categorical variables in GB models: [bit.ly/CatBoostComparison](bit.ly/CatBoostComparison)
+* CatBoost R usage examples: [bit.ly/CatBoostUsage](bit.ly/CatBoostUsage)
+* Comparisons between CatBoost, xgboost, and lightgbm:
+  * [bit.ly/GBMComparison1](bit.ly/GBMComparison1)
+  * [bit.ly/GBMComparison2](bit.ly/GBMComparison2)
+  * [bit.ly/GBMComparison3](bit.ly/GBMComparison3)
+
+---
+
+class: center, middle
+
+# Thanks!
+
+Special thanks to Brandon Greenwell for answering my tree-related questions.
+    </textarea>
+<style data-target="print-only">@media screen {.remark-slide-container{display:block;}.remark-slide-scaler{box-shadow:none;}}</style>
+<script src="https://remarkjs.com/downloads/remark-latest.min.js"></script>
+<script>var slideshow = remark.create({
+"highlightStyle": "github",
+"highlightLines": true,
+"countIncrementalSlides": false
+});
+if (window.HTMLWidgets) slideshow.on('afterShowSlide', function (slide) {
+  window.dispatchEvent(new Event('resize'));
+});
+(function(d) {
+  var s = d.createElement("style"), r = d.querySelector(".remark-slide-scaler");
+  if (!r) return;
+  s.type = "text/css"; s.innerHTML = "@page {size: " + r.style.width + " " + r.style.height +"; }";
+  d.head.appendChild(s);
+})(document);
+
+(function(d) {
+  var el = d.getElementsByClassName("remark-slides-area");
+  if (!el) return;
+  var slide, slides = slideshow.getSlides(), els = el[0].children;
+  for (var i = 1; i < slides.length; i++) {
+    slide = slides[i];
+    if (slide.properties.continued === "true" || slide.properties.count === "false") {
+      els[i - 1].className += ' has-continuation';
+    }
+  }
+  var s = d.createElement("style");
+  s.type = "text/css"; s.innerHTML = "@media print { .has-continuation { display: none; } }";
+  d.head.appendChild(s);
+})(document);
+// delete the temporary CSS (for displaying all slides initially) when the user
+// starts to view slides
+(function() {
+  var deleted = false;
+  slideshow.on('beforeShowSlide', function(slide) {
+    if (deleted) return;
+    var sheets = document.styleSheets, node;
+    for (var i = 0; i < sheets.length; i++) {
+      node = sheets[i].ownerNode;
+      if (node.dataset["target"] !== "print-only") continue;
+      node.parentNode.removeChild(node);
+    }
+    deleted = true;
+  });
+})();
+(function() {
+  "use strict"
+  // Replace <script> tags in slides area to make them executable
+  var scripts = document.querySelectorAll(
+    '.remark-slides-area .remark-slide-container script'
+  );
+  if (!scripts.length) return;
+  for (var i = 0; i < scripts.length; i++) {
+    var s = document.createElement('script');
+    var code = document.createTextNode(scripts[i].textContent);
+    s.appendChild(code);
+    var scriptAttrs = scripts[i].attributes;
+    for (var j = 0; j < scriptAttrs.length; j++) {
+      s.setAttribute(scriptAttrs[j].name, scriptAttrs[j].value);
+    }
+    scripts[i].parentElement.replaceChild(s, scripts[i]);
+  }
+})();
+(function() {
+  var links = document.getElementsByTagName('a');
+  for (var i = 0; i < links.length; i++) {
+    if (/^(https?:)?\/\//.test(links[i].getAttribute('href'))) {
+      links[i].target = '_blank';
+    }
+  }
+})();
+// adds .remark-code-has-line-highlighted class to <pre> parent elements
+// of code chunks containing highlighted lines with class .remark-code-line-highlighted
+(function(d) {
+  const hlines = d.querySelectorAll('.remark-code-line-highlighted');
+  const preParents = [];
+  const findPreParent = function(line, p = 0) {
+    if (p > 1) return null; // traverse up no further than grandparent
+    const el = line.parentElement;
+    return el.tagName === "PRE" ? el : findPreParent(el, ++p);
+  };
+
+  for (let line of hlines) {
+    let pre = findPreParent(line);
+    if (pre && !preParents.includes(pre)) preParents.push(pre);
+  }
+  preParents.forEach(p => p.classList.add("remark-code-has-line-highlighted"));
+})(document);</script>
+
+<script>
+slideshow._releaseMath = function(el) {
+  var i, text, code, codes = el.getElementsByTagName('code');
+  for (i = 0; i < codes.length;) {
+    code = codes[i];
+    if (code.parentNode.tagName !== 'PRE' && code.childElementCount === 0) {
+      text = code.textContent;
+      if (/^\\\((.|\s)+\\\)$/.test(text) || /^\\\[(.|\s)+\\\]$/.test(text) ||
+          /^\$\$(.|\s)+\$\$$/.test(text) ||
+          /^\\begin\{([^}]+)\}(.|\s)+\\end\{[^}]+\}$/.test(text)) {
+        code.outerHTML = code.innerHTML;  // remove <code></code>
+        continue;
+      }
+    }
+    i++;
+  }
+};
+slideshow._releaseMath(document);
+</script>
+<!-- dynamically load mathjax for compatibility with self-contained -->
+<script>
+(function () {
+  var script = document.createElement('script');
+  script.type = 'text/javascript';
+  script.src  = 'https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-MML-AM_CHTML';
+  if (location.protocol !== 'file:' && /^https?:/.test(script.src))
+    script.src  = script.src.replace(/^https?:/, '');
+  document.getElementsByTagName('head')[0].appendChild(script);
+})();
+</script>
+  </body>
+</html>

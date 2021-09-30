@@ -1,0 +1,122 @@
+---
+title: "xgboost Tidy Example"
+output:
+  html_document:
+    df_print: paged
+---
+
+This is essentially the same as the CatBoost example, simply modified for xgboost.
+
+```{r, results='hide', message=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(treesnip)
+library(parallel)
+```
+
+```{r}
+all_cores <- detectCores(logical = FALSE)
+cluster <- makeCluster(all_cores)
+doParallel::registerDoParallel(cluster)
+
+set.seed(1234)
+
+ames_data <- AmesHousing::make_ames() %>%
+  janitor::clean_names()
+
+ames_split <- rsample::initial_split(ames_data, strata = sale_price)
+ames_train <- training(ames_split)
+ames_test <- testing(ames_split)
+
+ames_recipe <- recipe(sale_price ~ ., data = ames_train) %>%
+  step_other(all_nominal(), threshold = 0.01) %>%
+  step_nzv(all_nominal()) %>%
+  step_dummy(all_nominal(), one_hot = T) %>%
+  prep()
+
+ames_cv_folds <- bake(ames_recipe, new_data = training(ames_split)) %>%  
+  vfold_cv(v = 5)
+```
+
+We're using the same tuning specification as for CatBoost:
+
+```{r}
+model <- boost_tree(
+  mode = "regression",
+  trees = 1000,
+  min_n = tune(),
+  tree_depth = tune(),
+  learn_rate = tune()
+) %>%
+  set_engine("xgboost", objective = "reg:squarederror")
+
+params <- parameters(
+  min_n(),
+  tree_depth(),
+  learn_rate()
+)
+
+tune_grid <- grid_max_entropy(params, size = 50)
+
+wf <- workflow() %>%
+  add_model(model) %>% 
+  add_formula(sale_price ~ .)
+
+tuned <- tune_grid(
+  object = wf,
+  resamples = ames_cv_folds,
+  grid = tune_grid,
+  metrics = metric_set(rmse, rsq, mae),
+  control = control_grid(verbose = TRUE)
+)
+
+tuned %>%
+  show_best(metric = "rmse", n = 10) %>%
+  pivot_longer(min_n:learn_rate, names_to = "variable", values_to = "value") %>%
+  ggplot(aes(value, mean)) +
+  geom_line(alpha = 1/2) +
+  geom_point() +
+  facet_wrap(~variable, scales = "free") +
+  ggtitle("Best parameters for RMSE")
+```
+
+```{r}
+best_params <-
+  tuned %>%
+  select_best("rmse")
+
+model_final <-
+  model %>%
+  finalize_model(best_params)
+
+train_processed <- bake(ames_recipe, new_data = ames_train)
+
+trained_model_all_data <- model_final %>%
+  fit(formula = sale_price ~ ., data = train_processed)
+
+train_prediction <- trained_model_all_data %>%
+  predict(new_data = train_processed) %>%
+  bind_cols(ames_train)
+
+train_prediction %>%
+  metrics(sale_price, .pred) %>%
+  mutate(.estimate = format(round(.estimate, 2), big.mark = ",")) %>%
+  knitr::kable()
+```
+
+```{r}
+test_processed <- bake(ames_recipe, new_data = ames_test)
+
+test_prediction <- trained_model_all_data %>%
+  predict(new_data = test_processed) %>%
+  bind_cols(ames_test)
+
+test_prediction %>%
+  metrics(sale_price, .pred) %>%
+  mutate(.estimate = format(round(.estimate, 2), big.mark = ",")) %>%
+  knitr::kable()
+```
+
+```{r}
+stopCluster(cluster)
+```
