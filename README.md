@@ -2,9 +2,9 @@
 
 An introduction to CatBoost in R. See:
 
-* presentation.html for the main presentation
-* basic_catboost_example.html for a basic CatBoost example notebook
-* catboost_tidy_example.Rmd for a tidymodels CatBoost example notebook
+* Main presentation: [bit.ly/CatBoostRIntro](bit.ly/CatBoostRIntro)
+* Basic CatBoost example notebook: [bit.ly/BasicCatBoostExample](bit.ly/BasicCatBoostExample)
+* Tidy CatBoost example: [bit.ly/TidyCatBoostExample](bit.ly/TidyCatBoostExample)
 
 Links:
 
